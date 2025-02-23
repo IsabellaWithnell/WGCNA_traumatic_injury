@@ -1,0 +1,894 @@
+---
+title: "WGCNA_humans"
+output: html_document
+date: "2024-05-30"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## R Markdown
+```{r}
+library(WGCNA)
+library(ggplot2)
+library(dplyr)
+library(doParallel)
+library(data.table)
+library(vroom)
+library(Matrix)
+library(Seurat)
+library(harmony)
+library(SeuratDisk)
+library(glmGamPoi)
+library(viridis)
+library(RColorBrewer)
+library(grDevices)
+library(readr)
+library(biomaRt)
+library(DESeq2)
+library(SummarizedExperiment)
+library(splines)
+library(rmcorr)
+library(foreach)
+library(lmerTest)
+library(effects)
+library(ggpubr)
+library(tidyverse)
+library(flashClust)
+library(impute)
+library(preprocessCore)
+library(babelgene)
+library(knitr)
+library(clusterProfiler)
+library(cowplot)
+library(egg)
+library(msigdbr)
+library(igraph)
+library(ggraph)
+library(tidygraph)
+library(pheatmap)
+library(tidyr)
+library(biomaRt)
+library(dplyr)
+library(msigdbr)
+library(clusterProfiler)
+library(org.Hs.eg.db) 
+
+```
+
+```{r}
+num_cores <- detectCores() - 1 
+cl <- makeCluster(num_cores)
+registerDoParallel(cl)
+```
+
+
+```{r}
+expression_data <- readRDS("~/PHD_bcells/pigs/se_new.rds")
+expression_data_check = expression_data@assays@data@listData[[1]]
+rownames(expression_data_check) = expression_data@NAMES
+expression_data_check = t(expression_data_check)
+
+head(rownames(expression_data_check))
+```
+
+
+Pick soft threshold
+```{r}
+sft <- pickSoftThreshold(expression_data_check, dataIsExpr = TRUE, networkType = "signed")
+sft_df <- data.frame(sft$fitIndices) %>%
+  dplyr::mutate(model_fit = -sign(slope) * SFT.R.sq)
+
+ggplot(sft_df, aes(x = Power, y = model_fit, label = Power)) +
+  geom_point() +
+  geom_text(nudge_y = 0.1) +
+  geom_hline(yintercept = 0.85, col = "red") +
+  ylim(c(min(sft_df$model_fit), 1.05)) +
+  xlab("Soft Threshold (power)") +
+  ylab("Scale Free Topology Model Fit, signed R^2") +
+  ggtitle("Scale independence") +
+  theme_classic()
+```
+
+Compute a correlation matrix using biweight midcorrelation & identify gene modules based on this
+```{r}
+human_corr_matrix <- bicor(expression_data_check, use = "pairwise.complete.obs")
+
+cmatrix_to_modules <-function(cmatrix, deepSplit = 4, minModuleSize = 20, power = 10, mergeCutHeight = 0.07, pamRespectsDendro = FALSE, cutHeight = 0.975, randomSeed = 1234)  {
+set.seed(randomSeed)
+adjacency <- adjacency.fromSimilarity(cmatrix, type = "signed", power = power)
+  TOM <- TOMdist(adjacency, TOMType = "signed")
+  clust <- hclust(as.dist(TOM), method = "average")
+  cutree <- cutreeDynamic(dendro = clust, distM = TOM, cutHeight = cutHeight, method = "hybrid", deepSplit = deepSplit, pamRespectsDendro = pamRespectsDendro, minClusterSize = minModuleSize, verbose = 3)
+
+  mergedColors <- mergeCloseModules(cmatrix, cutree, cutHeight = mergeCutHeight, verbose = 3)
+  modules <- labels2colors(cutree)
+  print(colnames(adjacency))
+  names(modules) <- colnames(adjacency)
+  plotDendroAndColors(clust, modules, dendroLabels = FALSE)
+  print(table(cutree))  
+  return(modules)
+}
+
+human_modules <- cmatrix_to_modules(human_corr_matrix)
+
+human_modules 
+```
+
+Refine gene modules
+```{r}
+
+expression_data = expression_data_check 
+
+MEs <- moduleEigengenes(expression_data, colors = human_modules)$eigengenes
+colnames(MEs) <- gsub("^ME", "", colnames(MEs))
+
+kME_matrix <- signedKME(expression_data, MEs)
+rownames(kME_matrix) <- colnames(expression_data)   
+colnames(kME_matrix) <- colnames(MEs)   
+
+# Reassign gray genes based on maximum kME value
+gray_genes <- which(human_modules == "grey")
+max_kME_values <- apply(kME_matrix[gray_genes, ], 1, max)
+
+# Reassign gray genes with kME > 0.30 to corresponding modules
+reassigned_modules <- apply(kME_matrix[gray_genes, ], 1, function(kME_row) {
+ if (max(kME_row) > 0.30) {
+     return(names(which.max(kME_row)))  
+   } else {
+    return("grey")  
+   }
+})
+
+human_modules[gray_genes] <- reassigned_modules
+
+
+# Reassign genes with low kME and remove those with kME < 0.30
+for (module in unique(human_modules)) {
+  print(module)
+  module_genes <- names(human_modules)[human_modules == module]
+ valid_genes <- module_genes[module_genes %in% rownames(kME_matrix)]   
+    if (module %in% colnames(kME_matrix)) {
+    # Remove genes with intramodular kME < 0.30
+     low_kME_genes <- valid_genes[!is.na(kME_matrix[valid_genes, module]) & kME_matrix[valid_genes, module] < 0.30]
+    
+    if (length(low_kME_genes) > 0) {
+     print(low_kME_genes)
+  
+       human_modules[low_kME_genes] <- NA
+    }
+    
+    # Reassign genes whose kME is > 0.10 lower than their max kME in other modules
+     for (gene in valid_genes) {
+       max_kME <- max(kME_matrix[gene, ], na.rm = TRUE)
+     intramodular_kME <- kME_matrix[gene, module]
+
+       if (is.na(intramodular_kME)) {
+         print("Skipping due to NA in kME")
+         next
+       }
+
+       if ((max_kME - intramodular_kME) > 0.10) {
+
+        new_module <- names(which.max(kME_matrix[gene, ]))
+       new_module <- gsub("^ME", "", new_module)   
+
+       if (new_module != "grey") {
+       print(paste("Gene", gene, "reassigned from", module, "to", new_module))
+          
+        human_modules[gene] <- new_module
+       } else {
+        print(paste("Gene", gene, "was skipped for reassignment because it would be assigned to grey"))
+        }
+     }
+   }
+ } else {
+   print(paste("Module", module, "not found in kME_matrix"))
+  }
+}
+
+human_modules <- human_modules[!is.na(human_modules)]
+
+unique_colors <- unique(human_modules)
+
+```
+
+
+Converts module assignments to letters by removing unclustered “grey” genes, computes module eigengenes and kme (module membership) values
+```{r}
+# function converts the default module names  to letters and remove grey
+modules_to_letters <- function(modules) {
+  
+  if (any(modules$module == "grey")) {
+    unclustered_features <- modules$feature[modules$module == "grey"]
+    modules <- modules[!(modules$feature %in% unclustered_features) ,]
+  }
+  
+  modules_to_letters <- LETTERS
+  modules_to_letters <- modules_to_letters[1:length(unique(modules$module))]
+  names(modules_to_letters) <- unique(modules$module)
+  modules$module <- sapply(modules$module, function(m) {modules_to_letters[names(modules_to_letters) == m]})
+  
+  return(modules)
+}
+
+converted_modules <- modules_to_letters(data.frame(feature = names(human_modules), module = human_modules))
+rownames(converted_modules) = converted_modules$feature
+valid_genes <- intersect(converted_modules$feature, colnames(expression_data))
+expression_data <- expression_data[, valid_genes] 
+colors_vector <- setNames(converted_modules$module, converted_modules$feature)
+MEs_list <- moduleEigengenes(expression_data, colors = colors_vector)
+MEs <- MEs_list$eigengenes 
+kME_table <- signedKME(expression_data, MEs)
+
+saveRDS(kME_table, file = "kME_table.rds")
+
+
+module_df <- converted_modules %>%
+  group_by(module) %>%
+  summarise(genes = list(feature)) %>%
+  deframe()
+
+module_summary <- tibble(
+  ModuleName = names(module_df),
+  NumGenes = map_int(module_df, ~ length(.x))
+)
+
+module_summary <- module_summary %>%
+  arrange(desc(NumGenes))
+
+print(module_summary,  n=50)
+
+saveRDS(module_df, file = "human_list_final_IW.rds")
+
+```
+
+
+
+Find gene pathways within modules
+```{r}
+
+newmat = t(expression_data_check)
+
+factor_enrichment_v2 <- function(moduleGenesList, method = "hyp", adj_p_cutoff = 0.1, min_genes = 3, species = "human", universe_correction = TRUE) {
+  enrich_res <- data.frame()
+  
+  for (module_name in names(moduleGenesList))  {
+    print(paste("Processing module:", module_name))   
+    
+    if (method == "hyp") {
+      ensembl_ids <- moduleGenesList[[module_name]]
+      mart <- useMart("ensembl", dataset = "hsapiens_gene_ensembl", host = "www.ensembl.org")
+      gene_info <- getBM(attributes = c('ensembl_gene_id', 'entrezgene_id', 'hgnc_symbol'), 
+                         filters = 'ensembl_gene_id', 
+                         values = ensembl_ids, 
+                         mart = mart)
+      entrez_ids <- gene_info$entrezgene_id[!is.na(gene_info$entrezgene_id)]
+      de <- entrez_ids
+
+      universe_info <- getBM(attributes = c('ensembl_gene_id', 'entrezgene_id'), 
+                             filters = 'ensembl_gene_id', 
+                             values = rownames(newmat), 
+                             mart = mart)
+
+      universe <- na.omit(as.vector(universe_info$entrezgene_id))
+      universe <- as.character(universe)
+
+      t2g <- msigdbr::msigdbr(species = species, category = "C2") %>%
+        dplyr::filter(gs_subcat != "CGP") %>%
+        dplyr::distinct(gs_name, entrez_gene)
+
+      enrich_res_single <- clusterProfiler::enricher(de, pvalueCutoff = 1, qvalueCutoff = 1, TERM2GENE = t2g, universe = universe)
+
+      if (!is.null(enrich_res_single) && nrow(enrich_res_single) > 0) {
+        enrich_res_single <- enrich_res_single[enrich_res_single$Count >= min_genes,]
+
+        enrich_res_single$adj_p <- p.adjust(enrich_res_single$pvalue, method = "BH")
+
+        enrich_res_single$core_enrichment <- sapply(enrich_res_single$geneID, function(genes) {
+          entrez_list <- unlist(strsplit(genes, "/"))  # Split Entrez IDs
+          gene_symbols <- bitr(entrez_list, fromType = "ENTREZID", toType = "SYMBOL", OrgDb = org.Hs.eg.db)
+          
+          if (nrow(gene_symbols) > 0) {
+            return(paste(gene_symbols$SYMBOL, collapse = ", "))
+          } else {
+            return(NA)
+          }
+        })
+      }
+    }
+
+    if (!is.null(enrich_res_single) && nrow(enrich_res_single) > 0) {
+      enrich_res_single <- enrich_res_single[which(enrich_res_single$adj_p < adj_p_cutoff),]
+      if (nrow(enrich_res_single) >= 1) {
+        print(paste("Adding module to results:", module_name))   
+        enrich_res_single$factor <- module_name
+        enrich_res <- rbind(enrich_res, enrich_res_single)
+      }
+    }
+  }
+  return(enrich_res)
+}
+
+gsea <- factor_enrichment_v2(module_df)
+head(gsea$core_enrichment)
+
+```
+
+Save results as a table
+```{r}
+
+rm(core_enrichment)
+
+final_table <- gsea %>%
+  rename(
+    module       = factor,       
+    term         = Description,  
+    set_size     = Count,
+    p_value      = pvalue,
+    adj_p_value  = p.adjust,
+    core_enrichmentnew = core_enrichment)
+
+write.csv(final_table, file = "newenrichment_table2.csv", row.names = FALSE)
+
+```
+
+
+Plot the GSEA
+```{r}
+unique_factors <- unique(gsea$factor)
+data = gsea
+colnames(data)
+data$Description
+data$neg_log_pvalue <- -log10(data$pvalue)
+
+data <- data %>% arrange(desc(neg_log_pvalue))
+
+data$Description <- gsub("^BIOCARTA_", "", data$Description)
+data$Description <- gsub("^REACTOME_", "", data$Description)
+data$Description <- gsub("^KEGG_", "", data$Description)
+data$Description <- gsub("^NABA_", "", data$Description)
+data$Description <- gsub("^PID_", "", data$Description)
+data$Description <- gsub("^WP_", "", data$Description)
+
+
+for (current_factor in unique_factors) {
+  
+  data_subset <- data %>%
+    filter(factor == current_factor) %>%
+     arrange(desc(neg_log_pvalue)) %>%
+    head(5) 
+    
+  plot = ggplot(data_subset, aes(x = reorder(Description, neg_log_pvalue), y = neg_log_pvalue)) +
+  geom_bar(stat = "identity", fill = "navy") +
+  coord_flip() +
+  labs(x = "", y = "-log10(p-value)", title = paste0("Module ", current_factor)) +
+  theme_minimal() +
+    theme(      axis.text.y = element_text(size = 12, face = "bold"),  
+      plot.margin = margin(t = 5, r = 5, b = 5, l = 5, unit = "pt"),  
+      plot.title = element_text(hjust = 0.5, face = "bold", size = 11) ,
+      panel.grid.major = element_blank(),  
+      panel.grid.minor = element_blank(),  
+      panel.background = element_blank(),  
+      legend.position = "none"  
+  )
+  plot <- set_panel_size(plot,
+                            width  = unit(5, "cm"),
+                            height = unit(2, "in"))
+
+  ggsave(filename = paste0("pigs/gsea2/humanpathways/", current_factor, "vfeb.png"), plot = plot, width = 15, height = 8)
+}
+
+```
+
+
+Associations of modules with traits
+```{r}
+expression_data_for_trait <- readRDS("~/PHD_bcells/pigs/se_new.rds")
+
+traitData = expression_data_for_trait@colData@listData
+list = expression_data_for_trait@colData@listData
+data_frame <- data.frame()
+
+if (length(names(list)) > 0) {
+  first_name <- names(list)[1]
+  initial_length <- length(list[[first_name]])
+  data_frame <- data.frame(matrix(nrow = initial_length, ncol = 0))
+}
+
+for (name in names(list)) {
+  data_frame[[name]] <- list[[name]]
+}
+
+rownames(data_frame) = data_frame$record_id
+expression_data_check = as.data.frame(expression_data_check)
+expression_data_check$record_id = rownames(expression_data_check)
+reordered_traitData <- merge(expression_data_check, traitData, by = "record_id", all.y = TRUE)
+rownames(reordered_traitData) <- reordered_traitData$record_id 
+expression_data_check <- reordered_traitData[, c(2:14164)]
+
+head(rownames(expression_data_check))
+
+newtrait <- reordered_traitData[, c(14165:14231)]
+
+newtrait$record_id = rownames(newtrait)
+newtrait$sex = as.factor(newtrait$sex)
+des_mat <- model.matrix(~ newtrait$sex)
+
+```
+
+Associations of modules with traits
+```{r}
+
+traitData = newtrait
+
+traitData <- traitData %>%
+  mutate(death = ifelse(is.na(death_date_time), 0, 1))
+
+traitData$mods_status = as.factor(traitData$mods_status)
+traitData$mods_status <- relevel(traitData$mods_status, ref = "NO MODS")
+
+traitData$shock = as.factor(traitData$shock)
+traitData$shock <- relevel(traitData$shock, ref = "bd_lessthan_6")
+
+traitData <- traitData %>%
+  mutate(death = ifelse(is.na(death_date_time), 0, 1))
+
+traitData <- traitData %>%
+  mutate(death = ifelse(is.na(death_date_time), 0, 1))
+
+recordMEs = MEs
+
+recordMEs$record_id = rownames(recordMEs)
+
+traitData$record_id
+merged_df <- merge(recordMEs, traitData, by="record_id")
+
+merged_dfnew <- merged_df
+
+me_columns <- grep("^ME", names(merged_dfnew), value = TRUE)
+
+me_columnsnew <- me_columns
+
+```
+
+Associations of modules with traits
+```{r}
+
+plot_p_values_with_clustering_and_stars <- function(data, me_columns, conditions, significance_level = 0.05) {
+  me_columns <- me_columns[!grepl("grey", me_columns)]
+
+  results <- list()
+  
+  condition_types <- sapply(conditions, function(cond) {
+    if (is.numeric(data[[cond]])) "numeric" else "factor"
+  })
+  
+  for (i in seq_along(conditions)) {
+    condition <- conditions[i]
+    
+    models <- lapply(me_columns, function(me_column) {
+      formula_text <- if (condition_types[condition] == "numeric") {
+        paste(me_column, "~", condition, "+ age_value + sex")
+      } else {
+        paste(me_column, "~ factor(", condition, ") + age_value + sex")
+      }
+      formula <- as.formula(formula_text)
+      lm(formula, data = data)
+    })
+    
+    names(models) <- me_columns
+    
+    p_values <- sapply(models, function(model) {
+      summary_model <- summary(model)
+      if (condition_types[condition] == "numeric") {
+        coef(summary_model)[condition, "Pr(>|t|)"]
+      } else {
+        coef(summary_model)[paste("factor(", condition, ")", levels(data[[condition]])[2], sep=""), "Pr(>|t|)"]
+      }
+    })
+    
+    coefficients <- sapply(models, function(model) {
+      summary_model <- summary(model)
+      if (condition_types[condition] == "numeric") {
+        coef(summary_model)[condition, "Estimate"]
+      } else {
+        coef(summary_model)[paste("factor(", condition, ")", levels(data[[condition]])[2], sep=""), "Estimate"]
+      }
+    })
+    
+    p_adjusted <- p.adjust(p_values, method = "BH")
+    
+    scaled_coefficients <- scale(coefficients)
+    
+    df <- data.frame(
+      Module = names(p_adjusted),
+      Condition = condition,
+      AdjustedPValue = -log10(p_adjusted),  
+      Coefficient = scaled_coefficients,    
+      Significant = ifelse(p_adjusted < significance_level, "*", "") 
+    )
+    results[[condition]] <- df
+  }
+  
+  combined_df <- bind_rows(results)
+
+  combined_df_wide <- combined_df %>%
+    filter(!grepl("grey", Module)) %>%  
+    dplyr::select(Module, Condition, Coefficient) %>%
+    pivot_wider(names_from = Condition, values_from = Coefficient)
+
+  significance_matrix <- combined_df %>%
+    filter(!grepl("grey", Module)) %>%  
+    dplyr::select(Module, Condition, Significant) %>%
+    pivot_wider(names_from = Condition, values_from = Significant) %>%
+    as.data.frame()
+
+  me_columns <- intersect(me_columns, combined_df_wide$Module)
+  
+  rownames(significance_matrix) <- me_columns  
+  significance_matrix <- dplyr::select(significance_matrix, -Module)
+
+  rownames(combined_df_wide) <- me_columns  
+  combined_df_wide <- dplyr::select(combined_df_wide, -Module)  
+  
+  pheatmap(as.matrix(combined_df_wide),
+           cluster_rows = TRUE,
+           cluster_cols = FALSE,
+           color = colorRampPalette(c("darkblue", "white", "darkred"))(50),
+           display_numbers = significance_matrix,
+           number_color = "black",
+           fontsize_number = 10,
+           angle_col = 45,
+           cellwidth = 15,
+           gaps_col = seq_len(length(conditions) - 1),
+           legend = TRUE,
+           main = "Hierarchical Clustering of Modules with Significance",
+           labels_row = me_columns,
+           fontsize_row = 10,
+           fontsize_col = 10,
+           annotation_legend = TRUE
+  )
+
+  pdf("scaled_coefficient_heatmap_wgcna.pdf", width = 10, height = 12)
+  pheatmap(as.matrix(combined_df_wide),
+           cluster_rows = TRUE,
+           cluster_cols = FALSE,
+           color = colorRampPalette(c("darkblue", "white", "darkred"))(50),
+           display_numbers = significance_matrix,
+           number_color = "black",
+           fontsize_number = 10,
+           angle_col = 45,
+           cellwidth = 25,
+           gaps_col = seq_len(length(conditions) - 1),
+           legend = TRUE,
+           main = "Hierarchical Clustering of Modules with Significance",
+           labels_row = me_columns,
+           fontsize_row = 10,
+           fontsize_col = 10,
+           annotation_legend = TRUE
+  )
+  dev.off()
+}
+
+merged_dfnew <- as.data.frame(merged_dfnew)
+me_columns <- intersect(me_columns, colnames(merged_dfnew))
+
+merged_dfnew$iss_value = as.numeric(merged_dfnew$iss_value )
+merged_dfnew$iss_value_log = merged_dfnew$iss_value
+merged_dfnew$iss_value_log =log(merged_dfnew$iss_value + 1)  
+
+plot_p_values_with_clustering_and_stars(merged_dfnew, me_columns, conditions = c("death", "iss_value_log", "shock"))
+
+
+```
+
+
+Conservation plots
+```{r}
+
+human_list <- readRDS("human_list_final_IW.rds")
+pig_list   <- readRDS("pig_modules_new.rds")
+
+ensembl <- useEnsembl(
+  biomart = "ensembl", 
+  dataset = "hsapiens_gene_ensembl", 
+  mirror  = "useast",
+  host    = "dec2021.archive.ensembl.org"
+)
+
+pig <- useEnsembl(
+  biomart = "ensembl", 
+  dataset = "sscrofa_gene_ensembl", 
+  mirror  = "useast",
+  host    = "dec2021.archive.ensembl.org"
+)
+
+# Map pig modules to human
+human_gene_modules <- list()
+
+for (module_name in names(pig_list)) {
+  pig_genes <- pig_list[[module_name]]
+  
+  human_genes <- getLDS(
+    attributes  = c("ensembl_gene_id"), 
+    filters     = "ensembl_gene_id", 
+    values      = pig_genes, 
+    mart        = pig, 
+    attributesL = c("ensembl_gene_id"), 
+    martL       = ensembl
+  )
+  
+  human_gene_ids <- na.omit(human_genes[, 2])
+  
+  human_gene_modules[[module_name]] <- human_gene_ids
+}
+
+pig_list <- human_gene_modules
+
+
+human_data <- read.csv("human_expression_data_check.csv", row.names = 1)
+
+pig_data <- read.csv("pig_expression_data.csv")
+head(colnames(pig_data))
+pig_data <- pig_data[ , -1]
+head(pig_data)
+
+pig_genes2 <- names(pig_data)
+
+attrs <- listAttributes(pig)
+subset(attrs, grepl("scrofa", attrs$name))
+
+human_genes <- getLDS(
+  attributes    = c("ensembl_gene_id",               
+                    "external_gene_name",             
+                    "hsapiens_homolog_ensembl_gene", 
+                    "hsapiens_homolog_associated_gene_name",
+                    "hsapiens_homolog_orthology_type",
+                    "hsapiens_homolog_orthology_confidence",
+                    "hsapiens_homolog_perc_id"),    
+  filters       = "ensembl_gene_id", 
+  values        = pig_genes2,     
+  mart          = pig, 
+  attributesL   = c("ensembl_gene_id", "external_gene_name"),  
+  martL         = ensembl
+)
+
+colnames(human_genes)
+
+
+df_map <- data.frame(
+  pig_gene         = human_genes$Gene.stable.ID,   
+  pig_gene_name    = human_genes$Gene.name,       
+  human_gene       = human_genes$Human.gene.stable.ID,   
+  human_gene_name  = human_genes$Human.gene.name,         
+  homology_type    = human_genes$Human.homology.type,    
+  confidence       = as.numeric(human_genes$Human.orthology.confidence..0.low..1.high.),
+  percent_id       = as.numeric(human_genes$X.id..target.Human.gene.identical.to.query.gene),
+  stringsAsFactors = FALSE
+)
+
+head(df_map)
+
+df_map_best <- df_map %>%
+  group_by(pig_gene) %>%  
+  group_modify(~ {
+    group_data <- .x  
+    
+    if (any(group_data$confidence == 1)) {
+      best_row <- group_data %>%
+        filter(confidence == 1) %>%
+        slice_max(order_by = percent_id, n = 1, with_ties = FALSE)
+    } else {
+      best_row <- group_data %>%
+        slice_max(order_by = percent_id, n = 1, with_ties = FALSE)
+    }
+    
+    return(best_row)  
+  }) %>%
+  ungroup()
+
+
+original_pig_genes <- colnames(pig_data)
+
+pig_cols_to_keep <- intersect(colnames(pig_data), df_map_best$pig_gene)
+pig_data_filtered <- pig_data[ , pig_cols_to_keep, drop = FALSE]
+
+rename_vec <- setNames(df_map_best$human_gene, df_map_best$pig_gene)
+
+colnames(pig_data_filtered) <- rename_vec[colnames(pig_data_filtered)]
+
+pig_data <- pig_data_filtered
+
+
+# Identify which pig genes were lost during the filtering
+lost_pig_genes <- setdiff(original_pig_genes, pig_cols_to_keep)
+# Check which pig genes had multiple human mappings 
+df_multimapped <- df_map %>%
+  group_by(pig_gene) %>%
+  tally(name = "n_matches") %>%
+  filter(n_matches > 1)
+#Identify  pig genes that have duplicates in df_map
+df_duplicates <- df_map %>%
+  group_by(pig_gene) %>%
+  filter(n() > 1) %>%
+  ungroup()
+#  Identify rows among duplicates not chosen in df_map_best
+df_non_chosen <- anti_join(df_duplicates, df_map_best,
+                           by = c("pig_gene", "human_gene"))
+human_map_counts <- df_map_best %>%
+  group_by(human_gene) %>%
+  summarize(nPig = n_distinct(pig_gene))
+pig_data = pig_data_filtered
+
+multiExpr <- list(
+  human = list(data = as.data.frame(human_data)),
+  pig = list(data = as.data.frame(pig_data))
+)
+
+assign_module_name <- function(gene_names, module_list) {
+  gene_colors <- rep("grey", length(gene_names))  
+  
+  for (module_name in names(module_list)) {
+    module_genes <- module_list[[module_name]]
+    
+    gene_colors[gene_names %in% module_genes] <- module_name
+  }
+  
+  return(gene_colors)
+}
+
+
+human_genes = colnames(human_data)
+human_colors <- assign_module_name(human_genes, human_list)
+
+pig_genes = colnames(pig_data)
+pig_colors <- assign_module_name(pig_genes, pig_list)
+
+colorList <- list(
+  human = human_colors,
+  pig = pig_colors
+)
+
+
+commonGenes = intersect(colnames(multiExpr[[1]]$data), colnames(multiExpr[[2]]$data))
+multiExpr[[1]]$data = multiExpr[[1]]$data[, commonGenes]
+multiExpr[[2]]$data = multiExpr[[2]]$data[, commonGenes]
+colorList[[1]] = colorList[[1]][match(commonGenes, colnames(multiExpr[[1]]$data))]
+colorList[[2]] = colorList[[2]][match(commonGenes, colnames(multiExpr[[2]]$data))]
+
+ncol(multiExpr[[1]]$data) == length(colorList[[1]])  
+ncol(multiExpr[[2]]$data) == length(colorList[[2]])  
+
+mp = modulePreservation(multiExpr, colorList,
+referenceNetworks = 1, nPermutations = 400,
+randomSeed = 1, quickCor = 0, verbose = 3, maxGoldModuleSize = 60)
+
+
+length(colorList)
+ref = "ref.human"
+test = "inColumnsAlsoPresentIn.pig"
+
+Obs.PreservationStats = mp$preservation$observed[[ref]][[test]]
+Z.PreservationStats = mp$preservation$Z[[ref]][[test]]
+
+Obs.PreservationStats[, "moduleSize"]
+
+Obs.PreservationStats
+Z.PreservationStats
+
+modColors = rownames(Obs.PreservationStats)
+moduleSize = Obs.PreservationStats$moduleSize
+
+selectModules = !(modColors %in% c("grey", "gold"))
+
+selectModules = !(modColors %in% c("grey"))
+
+point.label = modColors[selectModules]
+
+medianRank=Obs.PreservationStats$medianRank.pres
+Zsummary=Z.PreservationStats$Zsummary.pres
+
+blue_color <- "dodgerblue"  
+
+pdf("medianRank_Preservation_newtest_finalgoldnew.pdf", width = 8, height = 6)
+
+plot(moduleSize[selectModules], medianRank[selectModules], col=1,
+     bg=blue_color, pch = 21, main="medianRank Preservation",
+     cex = 2, ylab ="medianRank", xlab="Module size", log="x")
+labelPoints(moduleSize[selectModules], medianRank[selectModules], point.label, cex=1, offs=0.03)
+
+dev.off()
+
+pdf("Zsummary_Preservatio_newtest_final.pdf", width = 8, height = 6)
+
+plot(moduleSize[selectModules], Zsummary[selectModules], col = 1,
+     bg=blue_color, pch = 21, main="Zsummary Preservation",
+     cex = 2, ylab ="Zsummary", xlab = "Module size", log = "x")
+labelPoints(moduleSize[selectModules], Zsummary[selectModules], point.label, cex=1, offs=0.03)
+
+abline(h=0)
+abline(h=2, col = "blue", lty = 2)
+abline(h=10, col = "red", lty = 2)
+
+dev.off()
+
+
+```
+
+
+View the gene networks within the modules
+```{r}
+
+human_data = read.csv("human_expression_data_check.csv", row.names = 1)
+kME_matrix =  readRDS("kME_table.rds")
+
+
+extract_top_kME_genes <- function(kME_matrix, module_name, top_n = 50) {
+  module_kME <- kME_matrix[, module_name]
+    kME_with_names <- setNames(module_kME, rownames(kME_matrix))  
+  sorted_kME <- sort(kME_with_names, decreasing = TRUE)
+    top_genes <- head(sorted_kME, top_n)
+    return(data.frame(gene = names(top_genes), kME = top_genes))
+}
+
+top_genes_ml <- extract_top_kME_genes(kME_matrix, "kMEP", top_n = 30)
+
+
+gene_expression_data <- human_data[, colnames(human_data) %in% top_genes_ml$gene]
+cor_matrix <- cor(gene_expression_data)
+ensembl_ids <- rownames(cor_matrix)
+
+ensembl <- useEnsembl(biomart = "ensembl", 
+                      dataset = "hsapiens_gene_ensembl", 
+                      mirror = "useast",
+                      host = "dec2021.archive.ensembl.org")
+
+
+genes_mapped <- getBM(attributes = c("ensembl_gene_id", "hgnc_symbol"),
+                      filters = "ensembl_gene_id", 
+                      values = ensembl_ids, 
+                      mart = ensembl)
+
+mapped_symbols <- genes_mapped$hgnc_symbol[match(rownames(cor_matrix), genes_mapped$ensembl_gene_id)]
+
+rownames(cor_matrix) <- ifelse(mapped_symbols != "", mapped_symbols, rownames(cor_matrix))  
+colnames(cor_matrix) <- ifelse(mapped_symbols != "", mapped_symbols, rownames(cor_matrix))  
+
+threshold <- 0.75
+
+adj_matrix <- (abs(cor_matrix) > threshold) * cor_matrix
+
+graph <- graph.adjacency(adj_matrix, mode = "undirected", weighted = TRUE, diag = FALSE)
+
+
+p = ggraph(graph, layout = "fr") +  
+  geom_edge_link(aes(edge_width = weight), edge_colour = "grey") +  
+  geom_node_point(size = 5, color = "dodgerblue") + 
+  geom_node_text(aes(label = name), repel = TRUE, size = 3) + 
+  theme_void() 
+p 
+
+
+dev.off()
+
+pdf("my_graphkMEPq_plot_new.pdf", width = 10, height = 10)   
+
+p = ggraph(graph, layout = "fr") +  
+  geom_edge_link(aes(edge_width = weight), edge_colour = "grey", edge_width = 0.5) +  
+  geom_node_point(size = 8, color = "red") +  
+  geom_node_text(aes(label = name), repel = TRUE, size = 12) +  
+  theme_void()  
+print(p)
+
+dev.off()
+
+
+```
+
+
+
+
+
+
