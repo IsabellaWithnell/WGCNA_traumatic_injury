@@ -1,0 +1,483 @@
+  ---
+output: reprex::reprex_document
+knit: reprex::reprex_render
+---
+
+```{r}
+setwd("/home/withnell/PHD_bcells")
+library(SummarizedExperiment)
+library(splines)
+library(rmcorr)
+library(foreach)
+library(doParallel)
+library(lmerTest)
+library(effects)
+library(ggplot2)
+library(ggpubr)
+library(rmcorr)
+library(foreach)
+library(doParallel)
+library(lmerTest)
+library(effects)
+library(flashClust)
+library(ggplot2)
+library(ggpubr)
+library(impute)
+library(preprocessCore)
+library(WGCNA)
+library(babelgene)
+library(knitr)
+library(clusterProfiler)
+library(dplyr)
+library(ggplot2)
+library(purrr)
+library(babelgene)
+library(knitr)
+library(clusterProfiler)
+library(biomaRt)
+library(org.Hs.eg.db)
+
+```
+
+
+Load in new files and format properly
+```{r}
+newpheno = read.csv("pigs/pheno_data.csv")
+newmat = read.csv("pigs/logcpm.csv")
+head(newmat)
+rownames(newmat) = newmat$X
+newmat <- newmat[,-1]
+colnames(newmat) = newpheno$Sample_id
+
+cols_to_remove <- grep("Line-in", names(newmat), ignore.case=TRUE)
+
+newmat <- newmat[,-cols_to_remove]
+newpheno <- newpheno[newpheno$Time_detail != "LineIN", ]
+
+df = newmat
+df <- as_tibble(df, rownames="feature")
+df <- pivot_longer(df, -feature, names_to="sample", values_to="expression")
+
+newpheno$sample = newpheno$X 
+newpheno$individual_id = newpheno$Subject
+
+df <- df %>%
+  left_join(newpheno, by = c("sample" = "sample"))
+
+df$sample = df$sample
+df$individual_id = df$Subject
+df = df[, -(4:12)]
+df = df[, -(4:5)]
+
+unique_features <- unique(df$sample)
+
+```
+
+
+Create correlation matrix using rmcorr (repeated measures correlation)
+```{r}
+
+calc_cor_matrix <- function(long_data) {
+  
+  unique_features <- unique(long_data$feature)
+  
+  matrix_data <- long_data[long_data$feature == unique_features[1] ,]
+  matrix_data <- dplyr::select(matrix_data, sample, individual_id)
+  matrix_data_nrow <- nrow(matrix_data)
+  
+  
+  for (cname in unique_features) {
+    
+    if (which(unique_features == cname) %% 1000 == 0) {
+      print(which(unique_features == cname))
+    }
+    
+    feature_values <- long_data[long_data$feature == cname ,]
+    feature_values <- dplyr::select(feature_values, -feature)
+    colnames(feature_values) <- gsub("expression", cname, colnames(feature_values))
+    
+    stopifnot(nrow(feature_values) == nrow(matrix_data))
+    stopifnot(all(feature_values$sample %in% matrix_data$sample))
+    stopifnot(!any(duplicated(feature_values$sample)))
+    
+    matrix_data <- dplyr::left_join(matrix_data, feature_values, by = c("sample" = "sample", "individual_id" = "individual_id"))
+  }
+  
+  stopifnot(nrow(matrix_data) == matrix_data_nrow)
+  
+  cores <- detectCores(logical = FALSE)
+  print(paste0("Using ", cores, " cores"))
+  
+  cl <- makeCluster(cores[1]) 
+  registerDoParallel(cl)
+  
+  finalMatrix <- foreach(i = 1:length(unique_features), .combine = cbind) %dopar% {
+    
+    tempMatrix <- matrix(nrow = length(unique_features), ncol = 1)
+    i_feature <- unique_features[i]
+    colnames(tempMatrix) <- i_feature
+    rownames(tempMatrix) <- rep("", length(unique_features))
+    
+    for (j in 1:length(unique_features)) {
+     
+      if (i == j) {
+        
+        tempMatrix[j, 1] <- 1
+        break
+        
+      } else {
+        
+        j_feature <- unique_features[j]
+        
+        combined_data <- data.frame(
+          "individual_id" = matrix_data$individual_id,
+          "feature_1" = matrix_data[[i_feature]],
+          "feature_2" = matrix_data[[j_feature]]
+        )
+        
+        tempMatrix[j, 1] <- rmcorr::rmcorr(
+          individual_id,
+          feature_1,
+          feature_2,
+          combined_data
+        )$r
+      }
+    }
+    
+    rownames(tempMatrix) <- unique_features
+    
+    return(tempMatrix) 
+  }
+  
+  stopCluster(cl)
+  
+  finalMatrix[lower.tri(finalMatrix)] <- t(finalMatrix)[lower.tri(finalMatrix)]
+  stopifnot(isSymmetric(finalMatrix))
+  
+  return(finalMatrix)
+}
+
+corr_matrix = calc_cor_matrix(df)
+
+write.csv(corr_matrix, "check.csv")
+```
+
+
+Find wgcna gene modules
+```{r}
+pig_corr <- as.matrix(data.table::fread("Z_Old_Figures_backup/check.csv"), rownames = 1)
+num_unique_genes <- nrow(pig_corr)
+
+
+cmatrix_to_modules <-function(cmatrix, deepSplit = 4, minModuleSize = 20, powers = 1:30, mergeCutHeight = 0.07, pamRespectsDendro = FALSE, cutHeight = 0.975, randomSeed = 1234)  {
+  if (length(powers) > 1) {
+    threshold <- pickSoftThreshold.fromSimilarity((0.5 * (1 + cmatrix)), RsquaredCut = 0.85, powerVector = powers, verbose = 2)
+    power <- threshold$powerEstimate
+    
+  } else {
+    power <- powers
+  }
+  print(power)
+
+  adjacency <- adjacency.fromSimilarity(cmatrix, type = "signed", power = power)
+  
+  TOM <- TOMdist(adjacency, TOMType = "signed")
+
+  clust <- hclust(as.dist(TOM), method = "average")
+
+  cutree <- cutreeDynamic(dendro = clust, distM = TOM, method = "hybrid", cutHeight = cutHeight, deepSplit = deepSplit, pamRespectsDendro = pamRespectsDendro, minClusterSize = minModuleSize, verbose = 3)
+  print(sum(cutree == 0))
+  print(table(cutree))
+
+  mergedColors <- mergeCloseModules(cmatrix, cutree, cutHeight = mergeCutHeight, verbose = 3)
+  
+  modules <- labels2colors(cutree)
+  names(modules) <- colnames(adjacency)
+  plotDendroAndColors(clust, modules, dendroLabels = FALSE)
+  
+  return(modules)
+}
+
+pig_modules <- cmatrix_to_modules(pig_corr)
+
+```
+
+
+Getting expression of each gene from each sample 
+```{r}
+
+data_wide <- df %>%
+  tidyr::spread(key = feature, value = expression)
+
+reordered_prot_wide <- dplyr::select(data_wide, sample)
+
+for (gene_id in names(pig_modules)) {
+  
+  col <- data.frame(data_wide[[gene_id]])
+  colnames(col) <- gene_id
+  
+  reordered_prot_wide <- cbind(reordered_prot_wide, col)
+}
+
+```
+
+Filter the gene modules
+```{r}
+expression_data <- as.matrix(reordered_prot_wide[,-1]) 
+
+MEs <- moduleEigengenes(expression_data, colors = pig_modules)$eigengenes
+rownames(MEs)
+colnames(MEs) <- gsub("^ME", "", colnames(MEs))
+
+kME_matrix <- signedKME(expression_data, MEs)
+
+rownames(kME_matrix) <- colnames(expression_data)  
+colnames(kME_matrix) <- colnames(MEs)  
+
+# Reassign gray proteins based on maximum kME value
+gray_proteins <- which(pig_modules == "grey")
+unique(gray_proteins)
+
+max_kME_values <- apply(kME_matrix[gray_proteins, ], 1, max)
+
+# Reassign proteins with low kME and remove those with kME < 0.30
+ for (module in unique(pig_modules)) {
+   print(module)
+  module_proteins <- names(pig_modules)[pig_modules == module]
+   valid_proteins <- module_proteins[module_proteins %in% rownames(kME_matrix)]  
+  
+   if (module %in% colnames(kME_matrix)) {
+
+    low_kME_proteins <- valid_proteins[!is.na(kME_matrix[valid_proteins, module]) & kME_matrix[valid_proteins, module] < 0.30]
+    
+    if (length(low_kME_proteins) > 0) {
+
+      print("Genes removed due to low kME:")
+     print(low_kME_proteins)
+      
+       pig_modules[low_kME_proteins] <- NA
+     }
+    
+     for (protein in valid_proteins) {
+       max_kME <- max(kME_matrix[protein, ], na.rm = TRUE)
+       intramodular_kME <- kME_matrix[protein, module]
+
+       if (is.na(intramodular_kME)) {
+         print("Skipping due to NA in kME")
+         next
+       }
+
+       if ((max_kME - intramodular_kME) > 0.10) {
+         new_module <- names(which.max(kME_matrix[protein, ]))
+         new_module <- gsub("^ME", "", new_module) 
+
+         if (new_module != "grey") {
+           print(paste("Gene", protein, "reassigned from", module, "to", new_module))
+          
+           pig_modules[protein] <- new_module
+         } else {
+           print(paste("Gene", protein, "was skipped for reassignment because it would be assigned to grey"))
+         }
+       }
+     }
+   } else {
+     print(paste("Module", module, "not found in kME_matrix"))
+   }
+ }
+
+pig_modules <- pig_modules[!is.na(pig_modules)]
+
+```
+
+Recalculated Kme values
+```{r}
+
+valid_genes <- intersect(names(pig_modules), colnames(expression_data))
+removed_genes <- setdiff(colnames(expression_data), valid_genes)
+
+pig_modules <- pig_modules[valid_genes]
+expression_data <- expression_data[, valid_genes]  
+
+MEs_list <- moduleEigengenes(expression_data, colors = pig_modules)
+MEs <- MEs_list$eigengenes   
+
+kME_table <- signedKME(expression_data, MEs)
+
+```
+
+
+
+Get hub genes
+```{r}
+calculateConnectivity <- function(gene, moduleGenes, correlationMatrix) {
+  sum(correlationMatrix[gene, moduleGenes])
+}
+
+top_hub_genes <- list()
+for(module in unique(pig_modules)) {
+  module_genes <- names(pig_modules)[pig_modules == module]
+  
+  connectivity <- sapply(module_genes, calculateConnectivity, moduleGenes = module_genes, correlationMatrix = pig_corr)
+  
+  top_genes <- sort(connectivity, decreasing = TRUE)[1:200]
+  top_hub_genes[[module]] <- names(top_genes)
+}
+
+
+mart <- useMart("ensembl", dataset = "sscrofa_gene_ensembl", host="dec2021.archive.ensembl.org")
+
+all_ensembl_ids <- unique(unlist(top_hub_genes))
+
+gene_names <- getBM(attributes = c('ensembl_gene_id', 'external_gene_name'), 
+                    filters = 'ensembl_gene_id', 
+                    values = all_ensembl_ids, 
+                    mart = mart)
+
+gene_name_vector <- setNames(gene_names$external_gene_name, gene_names$ensembl_gene_id)
+
+named_top_hub_genes <- lapply(top_hub_genes, function(module_genes) {
+  sapply(module_genes, function(gene) gene_name_vector[gene])
+})
+
+
+```
+
+
+
+Edit format and view gene no. in each module
+```{r}
+
+modules_to_numbers <- function(modules) {
+  
+  if (any(modules$module == "grey")) {
+    unclustered_features <- modules$feature[modules$module == "grey"]
+    modules <- modules[!(modules$feature %in% unclustered_features), ]
+  }
+  unique_modules <- unique(modules$module)
+  module_numbers <- setNames(seq_along(unique_modules), unique_modules)
+  
+  modules$module <- as.numeric(sapply(modules$module, function(m) module_numbers[m]))
+  
+  return(modules)
+}
+
+converted_modules <- modules_to_numbers(data.frame(feature = names(pig_modules), module = pig_modules))
+
+
+module_df <- converted_modules %>%
+  group_by(module) %>%
+  summarise(genes = list(feature)) %>%
+  deframe()
+
+module_summary <- tibble(
+  ModuleName = names(module_df),
+  NumGenes = map_int(module_df, ~ length(.x))
+)
+
+module_summary <- module_summary %>%
+  arrange(desc(NumGenes))
+
+saveRDS(module_df, file = "pig_modules_new.rds")
+
+```
+
+
+
+Find gene pathways within modules  
+```{r}
+
+library(biomaRt)
+library(org.Hs.eg.db)
+factor_enrichment_v2 = function(moduleGenesList, method = "hyp", adj_p_cutoff = 0.1, min_genes = 3,species = "human", universe_correction = FALSE) {
+  
+  enrich_res <- data.frame()
+  
+  for (module_name in names(moduleGenesList))  {
+    
+    if (method == "hyp") {
+            
+      ensembl_ids <- moduleGenesList[[module_name]]
+      mart <- useMart("ensembl", dataset = "sscrofa_gene_ensembl", host="https://dec2021.archive.ensembl.org")
+  
+      entrez_ids <- getBM(attributes = c('ensembl_gene_id', 'entrezgene_id'), 
+                          filters = 'ensembl_gene_id', 
+                          values = ensembl_ids, 
+                          mart = mart)
+      
+      check = orthologs(genes = entrez_ids$entrezgene_id, species = "pig", human = FALSE)
+      entrez_ids = check$human_entrez
+      
+      de <- entrez_ids[!is.na(entrez_ids)]
+      
+      universe = getBM(attributes=c('ensembl_gene_id', 'entrezgene_id'), 
+                       filters='ensembl_gene_id', 
+                       values=rownames(newmat), 
+                       mart=mart)
+      
+      universe <- as.vector(na.omit(universe$entrezgene_id))
+      universe = as.character(universe)
+      
+      uni = orthologs(genes = universe, species = "pig", human = FALSE)
+      universe = uni$human_entrez
+      universe = as.character(universe)
+      
+      
+      t2g <- msigdbr::msigdbr(species = "human", category = "C2") 
+      t2g <- t2g[t2g$gs_subcat != "CGP" ,]
+      t2g <- as.data.frame(dplyr::distinct(t2g, gs_name, entrez_gene))
+      
+      enrich_res_single <- clusterProfiler::enricher(de, pvalueCutoff = 1, qvalueCutoff = 1, TERM2GENE = t2g, universe = universe)
+      enrich_res_single <- enrich_res_single[enrich_res_single$Count >= min_genes ,]
+      
+      enrich_res_single$adj_p <- p.adjust(enrich_res_single$pvalue, method = "BH")
+
+        enrich_res_single$core_enrichment <- sapply(enrich_res_single$geneID, function(genes) {
+          entrez_list <- unlist(strsplit(genes, "/"))  # Split Entrez IDs
+          gene_symbols <- bitr(entrez_list, fromType = "ENTREZID", toType = "SYMBOL", OrgDb = org.Hs.eg.db)
+          
+          if (nrow(gene_symbols) > 0) {
+            return(paste(gene_symbols$SYMBOL, collapse = ", "))
+          } else {
+            return(NA)
+          }
+        })
+      
+    } else if (method == "ks") {
+      
+      stopifnot(FALSE)
+    }
+    
+    enrich_res_single <- enrich_res_single[which(enrich_res_single$adj_p < adj_p_cutoff) ,]
+    
+    if (nrow(enrich_res_single) >= 1) {
+      enrich_res_single$factor <- module_name
+      
+      enrich_res <- rbind(enrich_res, enrich_res_single)
+    }
+  }
+  
+  return(enrich_res)
+}
+
+gsea = factor_enrichment_v2(module_df)
+
+```
+
+```{r}
+
+final_table <- gsea %>%
+  rename(
+    module       = factor,       
+    term         = Description,  
+    set_size     = Count,
+    p_value      = pvalue,
+    adj_p_value  = p.adjust,
+    core_enrichmentnew = core_enrichment)
+
+write.csv(final_table, file = "newenrichment_table_pigs2.csv", row.names = FALSE)
+
+```
+
+
+
+
